@@ -40,6 +40,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from generator.FM import FMGenerator
+from generator.train_lora import apply_lora_to_model
 from generator.helium_w2v_frontend_adapter import HeliumToWav2VecFrontendAdapter
 from generator.options.base_options import BaseOptions
 from generator.wav2vec2 import Wav2VecModel
@@ -551,24 +552,46 @@ def load_ref_image(path: str | Path, device: torch.device, dtype: torch.dtype) -
 # FM + Renderer weight loading (identical to liveTryFM.py)
 # ---------------------------------------------------------------------------
 
+def _clean_generator_state(ckpt: dict) -> dict:
+    raw = ckpt.get("ema_state_dict") or ckpt.get("state_dict", ckpt.get("model", ckpt))
+    if isinstance(raw, dict) and "model" in raw and isinstance(raw["model"], dict):
+        raw = raw["model"]
+    return {k.replace("model.", "", 1) if k.startswith("model.") else k: v for k, v in raw.items()}
+
+
 def _load_fm(args: argparse.Namespace, device: torch.device) -> FMGenerator:
     t_total = time.perf_counter()
     fm = FMGenerator(args).to(device).eval()
     ckpt = torch.load(args.generator_path, map_location="cpu")
-    raw = ckpt.get("state_dict", ckpt.get("model", ckpt))
-    if isinstance(raw, dict) and "model" in raw and isinstance(raw["model"], dict):
-        raw = raw["model"]
-    cleaned = {k.replace("model.", "", 1) if k.startswith("model.") else k: v for k, v in raw.items()}
-    ema = ckpt.get("ema_state_dict")
-    if isinstance(ema, dict):
-        cleaned.update(ema)
+    cleaned = _clean_generator_state(ckpt)
     missing, unexpected = fm.load_state_dict(cleaned, strict=False)
-    _sync_cuda()
     print(
-        f"[liveTryHeliumFM][FM] loaded in {_ms(t_total):.0f}ms "
-        f"missing={len(missing)} unexpected={len(unexpected)}",
+        f"[liveTryHeliumFM][FM] base loaded missing={len(missing)} unexpected={len(unexpected)}",
         flush=True,
     )
+    lora_path = str(getattr(args, "lora_generator_path", "") or "")
+    if lora_path:
+        apply_lora_to_model(
+            fm,
+            rank=int(getattr(args, "lora_rank", 64) or 64),
+            alpha=float(getattr(args, "lora_alpha", 128) or 128),
+            dropout=float(getattr(args, "lora_dropout", 0.05)),
+            include_pose_lora=not bool(getattr(args, "no_lora_pose_projection", False)),
+            include_audio_lora=not bool(getattr(args, "no_lora_audio_projection", False)),
+            only_pose_lora=bool(getattr(args, "only_lora_pose_projection", False)),
+        )
+        lora_ckpt = torch.load(lora_path, map_location="cpu")
+        lora_cleaned = _clean_generator_state(lora_ckpt)
+        missing_lora, unexpected_lora = fm.load_state_dict(lora_cleaned, strict=False)
+        lora_keys = sum(1 for key in lora_cleaned if "lora_" in key)
+        print(
+            f"[liveTryHeliumFM][FM] lora loaded path={lora_path} "
+            f"lora_keys={lora_keys} missing={len(missing_lora)} unexpected={len(unexpected_lora)}",
+            flush=True,
+        )
+    fm.to(device).eval()
+    _sync_cuda()
+    print(f"[liveTryHeliumFM][FM] loaded in {_ms(t_total):.0f}ms", flush=True)
     return fm
 
 
@@ -804,6 +827,12 @@ class LiveHeliumFMEngine:
             ta_r = self.renderer.adapt(self.ref_x.to(dtype=self.dtype), self.g_r)
             self.m_r = self.renderer.latent_token_decoder(ta_r)
         _sync_cuda()
+        self.eye_blink_enabled = bool(getattr(args, "enable_eye_blink_composite", False))
+        self._blink_maps: tuple[torch.Tensor, ...] | None = None
+        self._eye_masks: tuple[torch.Tensor, ...] | None = None
+        self._render_frame_cursor: int = 0
+        if self.eye_blink_enabled:
+            self._init_eye_blink_composite()
 
         # Moshi models for Helium extraction
         self._init_moshi(args)
@@ -890,6 +919,7 @@ class LiveHeliumFMEngine:
         """Call when a new WebSocket client connects or sends 'start'."""
         self.stream_state = None
         self.abs_frame = 0
+        self._render_frame_cursor = 0
         self.helium_context_tail = None
         self.helium_deque = None
         self.helium_deque_filled = 0
@@ -928,6 +958,7 @@ class LiveHeliumFMEngine:
         print(f"[liveTryHeliumFM][warmup] fm={_ms(t0):.0f}ms motion={tuple(motion.shape)}", flush=True)
         self.stream_state = None
         self.abs_frame = 0
+        self._render_frame_cursor = 0
         self.helium_context_tail = None
         self.helium_deque = None
         self.helium_deque_filled = 0
@@ -937,6 +968,7 @@ class LiveHeliumFMEngine:
         _frames, _timings = self._render_motion(dummy_motion)
         _sync_cuda()
         print(f"[liveTryHeliumFM][warmup] renderer={_ms(t0):.0f}ms", flush=True)
+        self._render_frame_cursor = 0
 
         # Warmup JPEG pool
         t0 = time.perf_counter()
@@ -1220,6 +1252,112 @@ class LiveHeliumFMEngine:
         print(f"[liveTryHeliumFM] dumped last session -> {session_dir}", flush=True)
         return session_dir
 
+    def _extract_motion_tensor_from_payload(self, payload, path: str) -> torch.Tensor:
+        if isinstance(payload, torch.Tensor):
+            motion = payload
+        elif isinstance(payload, dict):
+            candidates = ["motion", "motion_latents", "latents", "full_motion", "pred_motion", "x"]
+            motion = None
+            for key in candidates:
+                value = payload.get(key)
+                if isinstance(value, torch.Tensor):
+                    motion = value
+                    break
+            if motion is None:
+                tensor_items = [
+                    value
+                    for value in payload.values()
+                    if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[-1] == int(self.args.dim_w)
+                ]
+                if tensor_items:
+                    motion = tensor_items[0]
+            if motion is None:
+                raise ValueError(
+                    f"No motion tensor found in blink_motion_path={path}. "
+                    f"Available keys={list(payload.keys())[:20]}"
+                )
+        else:
+            raise TypeError(f"Unsupported blink motion payload type {type(payload)} from {path}")
+
+        motion = motion.detach().float().cpu()
+        if motion.ndim == 3 and motion.shape[0] == 1:
+            motion = motion[0]
+        if motion.ndim != 2 or motion.shape[-1] != int(self.args.dim_w):
+            raise ValueError(
+                f"Blink motion must have shape (T,{int(self.args.dim_w)}) or (1,T,{int(self.args.dim_w)}); "
+                f"got {tuple(motion.shape)} from {path}"
+            )
+        return motion.contiguous()
+
+    def _make_eye_mask(self, height: int, width: int) -> torch.Tensor:
+        yy = torch.linspace(0.0, 1.0, int(height), device=self.device, dtype=self.dtype).view(1, 1, height, 1)
+        xx = torch.linspace(0.0, 1.0, int(width), device=self.device, dtype=self.dtype).view(1, 1, 1, width)
+        center_y = float(getattr(self.args, "eye_center_y", 0.405))
+        radius_x = max(float(getattr(self.args, "eye_radius_x", 0.145)), 1e-6)
+        radius_y = max(float(getattr(self.args, "eye_radius_y", 0.070)), 1e-6)
+        feather = max(float(getattr(self.args, "eye_feather", 0.10)), 1e-6)
+
+        mask = torch.zeros(1, 1, height, width, device=self.device, dtype=self.dtype)
+        for center_x in (
+            float(getattr(self.args, "eye_left_x", 0.36)),
+            float(getattr(self.args, "eye_right_x", 0.64)),
+        ):
+            dist = ((xx - center_x) / radius_x).square() + ((yy - center_y) / radius_y).square()
+            ellipse = ((1.0 + feather) - dist).clamp(0.0, feather) / feather
+            mask = torch.maximum(mask, ellipse)
+        return mask.clamp(0.0, 1.0).contiguous()
+
+    @torch.no_grad()
+    def _init_eye_blink_composite(self) -> None:
+        blink_path = str(getattr(self.args, "blink_motion_path", "") or "")
+        if not blink_path:
+            raise ValueError("--enable_eye_blink_composite requires --blink_motion_path")
+        if not Path(blink_path).is_file():
+            raise FileNotFoundError(f"blink_motion_path does not exist: {blink_path}")
+
+        payload = torch.load(blink_path, map_location="cpu")
+        blink_motion = self._extract_motion_tensor_from_payload(payload, blink_path)
+        blink_maps_parts: list[list[torch.Tensor]] = []
+        chunk = max(1, int(getattr(self.args, "render_sub_batch", 8)))
+        for start in range(0, int(blink_motion.shape[0]), chunk):
+            sub = blink_motion[start:start + chunk].to(self.device, dtype=self.dtype)
+            g_sub = self.g_r.expand(int(sub.shape[0]), -1)
+            ta_b = self.renderer.adapt(sub, g_sub)
+            maps_b = self.renderer.latent_token_decoder(ta_b)
+            if not blink_maps_parts:
+                blink_maps_parts = [[] for _ in range(len(maps_b))]
+            for idx, map_b in enumerate(maps_b):
+                blink_maps_parts[idx].append(map_b.detach())
+
+        self._blink_maps = tuple(torch.cat(parts, dim=0).contiguous() for parts in blink_maps_parts)
+        self._eye_masks = tuple(self._make_eye_mask(m.shape[-2], m.shape[-1]) for m in self._blink_maps)
+        _sync_cuda()
+        shapes = [tuple(m.shape) for m in self._blink_maps]
+        print(
+            f"[liveTryHeliumFM][blink] cached blink maps from {blink_path}: "
+            f"frames={int(blink_motion.shape[0])} shapes={shapes}",
+            flush=True,
+        )
+
+    def _composite_eye_blink_maps(
+        self,
+        current_maps: tuple[torch.Tensor, ...] | list[torch.Tensor],
+        start_frame: int,
+        num_frames: int,
+    ) -> tuple[torch.Tensor, ...]:
+        if self._blink_maps is None or self._eye_masks is None:
+            return tuple(current_maps)
+        blink_len = int(self._blink_maps[0].shape[0])
+        if blink_len <= 0:
+            return tuple(current_maps)
+        indices = (torch.arange(int(num_frames), device=self.device) + int(start_frame)) % blink_len
+        composited: list[torch.Tensor] = []
+        for cur, blink_all, mask in zip(current_maps, self._blink_maps, self._eye_masks):
+            blink = blink_all.index_select(0, indices).to(device=cur.device, dtype=cur.dtype)
+            mask = mask.to(device=cur.device, dtype=cur.dtype)
+            composited.append(blink * mask + cur * (1.0 - mask))
+        return tuple(composited)
+
     @torch.no_grad()
     def _render_motion(self, motion: torch.Tensor) -> tuple[np.ndarray, dict]:
         timings: dict = {}
@@ -1231,13 +1369,19 @@ class LiveHeliumFMEngine:
         m_r_sub = tuple(m.expand(n, -1, -1, -1) for m in self.m_r)
         f_r_sub = [f.expand(n, -1, -1, -1) for f in self.f_r]
 
+        render_start = self._render_frame_cursor
         fused = getattr(self.renderer, '_fused_render', None)
+        if self.eye_blink_enabled:
+            fused = None
         if fused is not None:
             frames = fused(motion, g_r_sub, m_r_sub, f_r_sub)
         else:
             ta_c = self.renderer.adapt(motion, g_r_sub)
             m_c = self.renderer.latent_token_decoder(ta_c)
+            if self.eye_blink_enabled:
+                m_c = self._composite_eye_blink_maps(m_c, render_start, n)
             frames = self.renderer.decode(m_c, m_r_sub, f_r_sub)
+        self._render_frame_cursor += n
 
         frames_np = frames.detach().float().clamp(0, 1).mul(255).to(torch.uint8)
         frames_np = frames_np.permute(0, 2, 3, 1).contiguous().cpu().numpy()
@@ -1453,6 +1597,13 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--port", type=int, default=8998)
         parser.add_argument("--html_path", default=str(ROOT / "static" / "index_v3_binary_fullscreen.html"))
         parser.add_argument("--generator_path", required=True)
+        parser.add_argument("--lora_generator_path", default="", help="Optional LoRA generator checkpoint to apply on top of --generator_path")
+        parser.add_argument("--lora_rank", type=int, default=64)
+        parser.add_argument("--lora_alpha", type=float, default=128.0)
+        parser.add_argument("--lora_dropout", type=float, default=0.05)
+        parser.add_argument("--no_lora_pose_projection", action="store_true")
+        parser.add_argument("--no_lora_audio_projection", action="store_true")
+        parser.add_argument("--only_lora_pose_projection", action="store_true")
         parser.add_argument("--renderer_path", required=True)
         parser.add_argument("--adapter_path", required=True, help="Frontend fp32 Helium->Wav2Vec2 projected-frontend adapter checkpoint")
         parser.add_argument("--adapter_num_layers", type=int, default=6, help="Transformer layers in the frontend adapter checkpoint")
@@ -1493,6 +1644,7 @@ class LiveHeliumFMOptions(BaseOptions):
         )
         parser.add_argument("--render_sub_batch", type=int, default=8)
         parser.add_argument("--jpeg_quality", type=int, default=86)
+        parser.add_argument("--reply_audio_gain", type=float, default=1.0, help="Accepted for launch-script compatibility")
         parser.add_argument("--device", default="cuda")
         parser.add_argument("--buffer_ms", type=int, default=80)
         parser.add_argument("--dump_motion", action="store_true", help="Dump last session motion/audio to disk")
@@ -1505,6 +1657,15 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--fp32", action="store_true")
         parser.add_argument("--tf32", action="store_true")
         parser.add_argument("--compile_renderer", action="store_true")
+        # Eye blink motion-map compositing
+        parser.add_argument("--enable_eye_blink_composite", action="store_true")
+        parser.add_argument("--blink_motion_path", default="", help="Cached blink motion latent .pt file")
+        parser.add_argument("--eye_left_x", type=float, default=0.36)
+        parser.add_argument("--eye_right_x", type=float, default=0.64)
+        parser.add_argument("--eye_center_y", type=float, default=0.405)
+        parser.add_argument("--eye_radius_x", type=float, default=0.145)
+        parser.add_argument("--eye_radius_y", type=float, default=0.070)
+        parser.add_argument("--eye_feather", type=float, default=0.10)
         return parser
 
 
